@@ -6,8 +6,22 @@
 // 2019-02-08: Updated to support shadowsocks-windows user rules.
 
 var proxy = __PROXY__;
-var userrules = __USERRULES__;
-var rules = __RULES__;
+var userrules = [];
+var rules = [];
+
+// convert to abp grammar
+var re = /^(@@)?\|\|.*?[^\^]$/;
+for (var i = 0; i < __RULES__.length; i++) {
+    var s = __RULES__[i];
+    if (s.match(re)) s += "^";
+    rules.push(s);
+}
+
+for (var i = 0; i < __USERRULES__.length; i++) {
+    var s = __USERRULES__[i];
+    if (s.match(re))  s += "^";
+    userrules.push(s);
+}
 
 /*
 * This file is part of Adblock Plus <http://adblockplus.org/>,
@@ -779,11 +793,30 @@ for (var i = 0; i < rules.length; i++) {
     defaultMatcher.add(Filter.fromText(rules[i]));
 }
 
+// PAC has no v6 support, it sucks
+var ip4Re = /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/
+
+var privateNet = [
+    ["10.0.0.0", "255.0.0.0"],
+    ["127.0.0.0", "255.0.0.0"],
+    ["172.16.0.0", "255.240.0.0"],
+    ["192.168.0.0", "255.255.0.0"],
+]
+
 function FindProxyForURL(url, host) {
+    if (host.match(ip4Re)) {
+        for (var i = 0; i < privateNet.length; i++) {
+            if (isInNet(host, privateNet[i][0], privateNet[i][1])) return direct;
+        }
+    }
     if (userrulesMatcher.matchesAny(url, host) instanceof BlockingFilter) {
         return proxy;
     }
     if (userrulesMatcher.matchesAny(url, host) instanceof WhitelistFilter) {
+        return direct;
+    }
+    // Hack for Geosite, it provides a whitelist...
+    if (defaultMatcher.matchesAny(url, host) instanceof WhitelistFilter) {
         return direct;
     }
     if (defaultMatcher.matchesAny(url, host) instanceof BlockingFilter) {

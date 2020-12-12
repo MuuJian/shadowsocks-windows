@@ -1,35 +1,85 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Pipes;
+using System.Net;
+using System.Reflection;
+using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using CommandLine;
 using Microsoft.Win32;
-
+using NLog;
+using ReactiveUI;
 using Shadowsocks.Controller;
 using Shadowsocks.Controller.Hotkeys;
 using Shadowsocks.Util;
 using Shadowsocks.View;
+using Splat;
+using WPFLocalizeExtension.Engine;
 
 namespace Shadowsocks
 {
-    static class Program
+    internal static class Program
     {
+        private static readonly Logger logger = LogManager.GetCurrentClassLogger();
+
         public static ShadowsocksController MainController { get; private set; }
         public static MenuViewController MenuController { get; private set; }
+        public static CommandLineOption Options { get; private set; }
         public static string[] Args { get; private set; }
+
+        // https://github.com/dotnet/runtime/issues/13051#issuecomment-510267727
+        public static readonly string ExecutablePath = Process.GetCurrentProcess().MainModule?.FileName;
+        public static readonly string WorkingDirectory = Path.GetDirectoryName(ExecutablePath);
+
+        private static readonly Mutex mutex = new Mutex(true, $"Shadowsocks_{ExecutablePath.GetHashCode()}");
+
         /// <summary>
         /// 应用程序的主入口点。
         /// </summary>
         /// </summary>
         [STAThread]
-        static void Main(string[] args)
+        private static void Main(string[] args)
         {
-            // .NET Framework 4.7.2 on Win7 compatibility
-            System.Net.ServicePointManager.SecurityProtocol |= 
-                System.Net.SecurityProtocolType.Tls | System.Net.SecurityProtocolType.Tls11 | System.Net.SecurityProtocolType.Tls12;
+            #region Single Instance and IPC
+            bool hasAnotherInstance = !mutex.WaitOne(TimeSpan.Zero, true);
 
             // store args for further use
             Args = args;
+            Parser.Default.ParseArguments<CommandLineOption>(args)
+                .WithParsed(opt => Options = opt)
+                .WithNotParsed(e => e.Output());
+
+            if (hasAnotherInstance)
+            {
+                if (!string.IsNullOrWhiteSpace(Options.OpenUrl))
+                {
+                    IPCService.RequestOpenUrl(Options.OpenUrl);
+                }
+                else
+                {
+                    MessageBox.Show(I18N.GetString("Find Shadowsocks icon in your notify tray.")
+                                    + Environment.NewLine
+                                    + I18N.GetString("If you want to start multiple Shadowsocks, make a copy in another directory."),
+                        I18N.GetString("Shadowsocks is already running."));
+                }
+                return;
+            }
+            #endregion
+
+            #region Enviroment Setup
+            Directory.SetCurrentDirectory(WorkingDirectory);
+            // todo: initialize the NLog configuartion
+            Model.NLogConfig.TouchAndApplyNLogConfig();
+
+            // .NET Framework 4.7.2 on Win7 compatibility
+            ServicePointManager.SecurityProtocol |=
+                SecurityProtocolType.Tls | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12;
+            #endregion
+
+            #region Compactibility Check
             // Check OS since we are using dual-mode socket
             if (!Utils.IsWinVistaOrHigher())
             {
@@ -41,59 +91,70 @@ namespace Shadowsocks
             // Check .NET Framework version
             if (!Utils.IsSupportedRuntimeVersion())
             {
-                if (DialogResult.OK == MessageBox.Show(I18N.GetString("Unsupported .NET Framework, please update to {0} or later.", "4.7.2"),
+                if (DialogResult.OK == MessageBox.Show(I18N.GetString("Unsupported .NET Framework, please update to {0} or later.", "4.8"),
                 "Shadowsocks Error", MessageBoxButtons.OKCancel, MessageBoxIcon.Error))
                 {
-                    //Process.Start("https://www.microsoft.com/download/details.aspx?id=53344");    // 4.6.2
-                    Process.Start("https://dotnet.microsoft.com/download/dotnet-framework/net472");
+                    Process.Start("https://dotnet.microsoft.com/download/dotnet-framework/net48");
                 }
                 return;
             }
+            #endregion
 
-            Utils.ReleaseMemory(true);
-            using (Mutex mutex = new Mutex(false, $"Global\\Shadowsocks_{Application.StartupPath.GetHashCode()}"))
-            {
-                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-                // handle UI exceptions
-                Application.ThreadException += Application_ThreadException;
-                // handle non-UI exceptions
-                AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
-                Application.ApplicationExit += Application_ApplicationExit;
-                SystemEvents.PowerModeChanged += SystemEvents_PowerModeChanged;
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
-                AutoStartup.RegisterForRestart(true);
+            #region Event Handlers Setup
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            // handle UI exceptions
+            Application.ThreadException += Application_ThreadException;
+            // handle non-UI exceptions
+            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+            Application.ApplicationExit += Application_ApplicationExit;
+            SystemEvents.PowerModeChanged += SystemEvents_PowerModeChanged;
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            AutoStartup.RegisterForRestart(true);
+            #endregion
 
-                if (!mutex.WaitOne(0, false))
-                {
-                    Process[] oldProcesses = Process.GetProcessesByName("Shadowsocks");
-                    if (oldProcesses.Length > 0)
-                    {
-                        Process oldProcess = oldProcesses[0];
-                    }
-                    MessageBox.Show(I18N.GetString("Find Shadowsocks icon in your notify tray.")
-                        + Environment.NewLine
-                        + I18N.GetString("If you want to start multiple Shadowsocks, make a copy in another directory."),
-                        I18N.GetString("Shadowsocks is already running."));
-                    return;
-                }
-                Directory.SetCurrentDirectory(Application.StartupPath);
+            // We would use this in v5.
+            // Parameters would have to be dropped from views' constructors (VersionUpdatePromptView)
+            //Locator.CurrentMutable.RegisterViewsForViewModels(Assembly.GetCallingAssembly());
+
+            // Workaround for hosting WPF controls in a WinForms app.
+            // We have to manually set the culture for the LocalizeDictionary instance.
+            // https://stackoverflow.com/questions/374518/localizing-a-winforms-application-with-embedded-wpf-user-controls
+            // https://stackoverflow.com/questions/14668640/wpf-localize-extension-translate-window-at-run-time
+            LocalizeDictionary.Instance.Culture = Thread.CurrentThread.CurrentCulture;
+
 #if DEBUG
-                Logging.OpenLogFile();
-
-                // truncate privoxy log file while debugging
-                string privoxyLogFilename = Utils.GetTempPath("privoxy.log");
-                if (File.Exists(privoxyLogFilename))
-                    using (new FileStream(privoxyLogFilename, FileMode.Truncate)) { }
-#else
-                Logging.OpenLogFile();
+            // truncate privoxy log file while debugging
+            string privoxyLogFilename = Utils.GetTempPath("privoxy.log");
+            if (File.Exists(privoxyLogFilename))
+                using (new FileStream(privoxyLogFilename, FileMode.Truncate)) { }
 #endif
-                MainController = new ShadowsocksController();
-                MenuController = new MenuViewController(MainController);
-                HotKeys.Init(MainController);
-                MainController.Start();
-                Application.Run();
+            MainController = new ShadowsocksController();
+            MenuController = new MenuViewController(MainController);
+
+            HotKeys.Init(MainController);
+            MainController.Start();
+
+            // Update online config 
+            Task.Run(async () =>
+            {
+                await Task.Delay(10 * 1000);
+                await MainController.UpdateAllOnlineConfig();
+            });
+
+#region IPC Handler and Arguement Process
+            IPCService ipcService = new IPCService();
+            Task.Run(() => ipcService.RunServer());
+            ipcService.OpenUrlRequested += (_1, e) => MainController.AskAddServerBySSURL(e.Url);
+
+            if (!string.IsNullOrWhiteSpace(Options.OpenUrl))
+            {
+                MainController.AskAddServerBySSURL(Options.OpenUrl);
             }
+#endregion
+            
+            Application.Run();
+
         }
 
         private static int exited = 0;
@@ -102,7 +163,7 @@ namespace Shadowsocks
             if (Interlocked.Increment(ref exited) == 1)
             {
                 string errMsg = e.ExceptionObject.ToString();
-                Logging.Error(errMsg);
+                logger.Error(errMsg);
                 MessageBox.Show(
                     $"{I18N.GetString("Unexpected error, shadowsocks will exit. Please report to")} https://github.com/shadowsocks/shadowsocks-windows/issues {Environment.NewLine}{errMsg}",
                     "Shadowsocks non-UI Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -115,7 +176,7 @@ namespace Shadowsocks
             if (Interlocked.Increment(ref exited) == 1)
             {
                 string errorMsg = $"Exception Detail: {Environment.NewLine}{e.Exception}";
-                Logging.Error(errorMsg);
+                logger.Error(errorMsg);
                 MessageBox.Show(
                     $"{I18N.GetString("Unexpected error, shadowsocks will exit. Please report to")} https://github.com/shadowsocks/shadowsocks-windows/issues {Environment.NewLine}{errorMsg}",
                     "Shadowsocks UI Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -128,20 +189,20 @@ namespace Shadowsocks
             switch (e.Mode)
             {
                 case PowerModes.Resume:
-                    Logging.Info("os wake up");
+                    logger.Info("os wake up");
                     if (MainController != null)
                     {
-                        System.Threading.Tasks.Task.Factory.StartNew(() =>
+                        Task.Factory.StartNew(() =>
                         {
                             Thread.Sleep(10 * 1000);
                             try
                             {
-                                MainController.Start(false);
-                                Logging.Info("controller started");
+                                MainController.Start(true);
+                                logger.Info("controller started");
                             }
                             catch (Exception ex)
                             {
-                                Logging.LogUsefulException(ex);
+                                logger.LogUsefulException(ex);
                             }
                         });
                     }
@@ -150,9 +211,9 @@ namespace Shadowsocks
                     if (MainController != null)
                     {
                         MainController.Stop();
-                        Logging.Info("controller stopped");
+                        logger.Info("controller stopped");
                     }
-                    Logging.Info("os suspend");
+                    logger.Info("os suspend");
                     break;
             }
         }

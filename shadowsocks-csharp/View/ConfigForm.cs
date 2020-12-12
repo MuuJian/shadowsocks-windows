@@ -2,7 +2,9 @@ using Shadowsocks.Controller;
 using Shadowsocks.Model;
 using Shadowsocks.Properties;
 using System;
+using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
 using System.Windows.Forms;
 
 namespace Shadowsocks.View
@@ -17,14 +19,94 @@ namespace Shadowsocks.View
 
         private bool isChange = false;
 
+        private class EncryptionMethod
+        {
+            public readonly string name;
+            public readonly bool deprecated;
+
+            // Edit here to add/delete encryption method displayed in UI
+            private static string[] deprecatedMethod = new string[]
+            {
+                "rc4-md5",
+                "salsa20",
+                "chacha20",
+                "bf-cfb",
+                "chacha20-ietf",
+                "aes-256-cfb",
+                "aes-192-cfb",
+                "aes-128-cfb",
+                "aes-256-ctr",
+                "aes-192-ctr",
+                "aes-128-ctr",
+                "camellia-256-cfb",
+                "camellia-192-cfb",
+                "camellia-128-cfb",
+            };
+            private static string[] inuseMethod = new string[]
+            {
+                "aes-256-gcm",
+                "aes-192-gcm",
+                "aes-128-gcm",
+                "chacha20-ietf-poly1305",
+                "xchacha20-ietf-poly1305",
+            };
+            public static EncryptionMethod[] AllMethods
+            {
+                get
+                {
+                    if (!init) Init();
+                    return allMethods;
+                }
+            }
+            private static bool init = false;
+            private static EncryptionMethod[] allMethods;
+            private static Dictionary<string, EncryptionMethod> methodByName = new Dictionary<string, EncryptionMethod>();
+            private static void Init()
+            {
+                var all = new List<EncryptionMethod>();
+
+                all.AddRange(inuseMethod.Select(i => new EncryptionMethod(i, false)));
+                all.AddRange(deprecatedMethod.Select(d => new EncryptionMethod(d, true)));
+
+                allMethods = all.ToArray();
+                foreach (var item in all)
+                {
+                    methodByName[item.name] = item;
+                }
+                init = true;
+            }
+
+            public static EncryptionMethod GetMethod(string name)
+            {
+                if (!init) Init();
+                bool success = methodByName.TryGetValue(name, out EncryptionMethod method);
+                if (!success)
+                {
+                    string defaultMethod = Server.DefaultMethod;
+                    MessageBox.Show(I18N.GetString("Encryption method {0} not exist, will replace with {1}", name, defaultMethod), I18N.GetString("Shadowsocks"));
+                    return methodByName[defaultMethod];
+                }
+                return method;
+            }
+
+            private EncryptionMethod(string name, bool deprecated)
+            {
+                this.name = name;
+                this.deprecated = deprecated;
+            }
+
+            public override string ToString()
+            {
+                return deprecated ? $"{name} ({I18N.GetString("deprecated")})" : name;
+            }
+        }
+
         public ConfigForm(ShadowsocksController controller)
         {
             Font = SystemFonts.MessageBoxFont;
             InitializeComponent();
+            EncryptionSelect.Items.AddRange(EncryptionMethod.AllMethods);
 
-            // a dirty hack
-            ServersListBox.Dock = DockStyle.Fill;
-            tableLayoutPanel5.Dock = DockStyle.Fill;
             PerformLayout();
 
             UpdateTexts();
@@ -115,12 +197,13 @@ namespace Shadowsocks.View
                     server = address,
                     server_port = addressPort.Value,
                     password = serverPassword,
-                    method = EncryptionSelect.Text,
+                    method = ((EncryptionMethod)EncryptionSelect.SelectedItem).name,
                     plugin = PluginTextBox.Text,
                     plugin_opts = PluginOptionsTextBox.Text,
                     plugin_args = PluginArgumentsTextBox.Text,
                     remarks = RemarksTextBox.Text,
                     timeout = timeout.Value,
+                    group = GroupTextBox.Text
                 };
 
                 return true;
@@ -227,7 +310,7 @@ namespace Shadowsocks.View
         {
             password = null;
             string outPassword;
-            if ((outPassword = PasswordTextBox.Text).IsNullOrWhiteSpace())
+            if (string.IsNullOrWhiteSpace(outPassword = PasswordTextBox.Text))
             {
                 if (!isSave && !isCopy && ServersListBox.Items.Count > 1 && I18N.GetString("New server").Equals(ServersListBox.Items[_lastSelectedIndex].ToString()))
                 {
@@ -316,7 +399,7 @@ namespace Shadowsocks.View
             IPTextBox.Text = server.server;
             ServerPortTextBox.Text = server.server_port.ToString();
             PasswordTextBox.Text = server.password;
-            EncryptionSelect.Text = server.method ?? Server.DefaultMethod;
+            EncryptionSelect.SelectedItem = EncryptionMethod.GetMethod(server.method ?? Server.DefaultMethod);
             PluginTextBox.Text = server.plugin;
             PluginOptionsTextBox.Text = server.plugin_opts;
             PluginArgumentsTextBox.Text = server.plugin_args;
@@ -327,6 +410,8 @@ namespace Shadowsocks.View
 
             RemarksTextBox.Text = server.remarks;
             TimeoutTextBox.Text = server.timeout.ToString();
+
+            GroupTextBox.Text = server.group;
 
             isChange = false;
         }
@@ -342,13 +427,13 @@ namespace Shadowsocks.View
             ServersListBox.Items.Clear();
             foreach (Server server in configuration.configs)
             {
-                ServersListBox.Items.Add(server.FriendlyName());
+                ServersListBox.Items.Add(server.ToString());
             }
         }
 
         private void LoadCurrentConfiguration()
         {
-            _modifiedConfiguration = controller.GetConfigurationCopy();
+            _modifiedConfiguration = controller.GetCurrentConfiguration();
             LoadServerNameListToUI(_modifiedConfiguration);
 
             _lastSelectedIndex = _modifiedConfiguration.index;
@@ -417,7 +502,7 @@ namespace Shadowsocks.View
             }
             if (_lastSelectedIndex >= 0 && _lastSelectedIndex < _modifiedConfiguration.configs.Count)
             {
-                ServersListBox.Items[_lastSelectedIndex] = _modifiedConfiguration.configs[_lastSelectedIndex].FriendlyName();
+                ServersListBox.Items[_lastSelectedIndex] = _modifiedConfiguration.configs[_lastSelectedIndex].ToString();
             }
             UpdateButtons();
             LoadSelectedServerDetails();
@@ -490,21 +575,18 @@ namespace Shadowsocks.View
 
         private void MoveConfigItem(int step)
         {
-            int index = ServersListBox.SelectedIndex;
-            Server server = _modifiedConfiguration.configs[index];
-            object item = ServersListBox.Items[index];
+            var server = _modifiedConfiguration.configs[_lastSelectedIndex];
+            var newIndex = _lastSelectedIndex + step;
 
-            _modifiedConfiguration.configs.Remove(server);
-            _modifiedConfiguration.configs.Insert(index + step, server);
-            _modifiedConfiguration.index += step;
+            _modifiedConfiguration.configs.RemoveAt(_lastSelectedIndex);
+            _modifiedConfiguration.configs.Insert(newIndex, server);
 
             ServersListBox.BeginUpdate();
-            ServersListBox.Enabled = false;
-            _lastSelectedIndex = index + step;
-            ServersListBox.Items.Remove(item);
-            ServersListBox.Items.Insert(index + step, item);
-            ServersListBox.Enabled = true;
-            ServersListBox.SelectedIndex = index + step;
+
+            LoadServerNameListToUI(_modifiedConfiguration);
+
+            _lastSelectedIndex = newIndex;
+            ServersListBox.SelectedIndex = newIndex;
             ServersListBox.EndUpdate();
 
             UpdateButtons();
